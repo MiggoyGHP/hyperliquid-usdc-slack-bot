@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.dev.vars
+
+# NOTE: state.json is deliberately NOT ignored. The GitHub Actions workflow
+# commits it each run; that commit is also what stops GitHub disabling the
+# schedule after 60 days of inactivity. It contains no secrets.

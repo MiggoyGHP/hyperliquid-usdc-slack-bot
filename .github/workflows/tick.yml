@@ -1,0 +1,66 @@
+name: Hyperliquid USDC utilization
+
+on:
+  schedule:
+    # Hourly at :05. GitHub runs schedules on a best-effort basis and commonly
+    # delays them 15-60 minutes under load, so treat this as "about hourly".
+    - cron: "5 * * * *"
+  workflow_dispatch:
+
+# Needed to commit state.json back to the repo. That commit is also what keeps
+# the schedule alive: GitHub disables cron on repos with no commits for 60 days.
+permissions:
+  contents: write
+
+# Never let a delayed run overlap a new one; state.json has no locking.
+concurrency:
+  group: hl-usdc-tick
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install runtime dependencies
+        run: pip install --disable-pip-version-check -r deploy/requirements-vm.txt
+
+      - name: Run one tick
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          STATE_FILE: state.json
+          HEARTBEAT_HOURS: "1"
+          ESCALATED_INTERVAL_HOURS: "1"
+          ESCALATE_AT: "0.79"
+          DISPLAY_TIMEZONE: Asia/Manila
+          TOKEN_INDEX: "0"
+        run: python -m hl_usdc_bot.tick_once
+
+      - name: Persist state
+        run: |
+          set -euo pipefail
+          if [[ -z "$(git status --porcelain state.json)" ]]; then
+            echo "State unchanged (tick was suppressed); nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git commit -m "chore: record tick $(date -u +'%Y-%m-%dT%H:%MZ')"
+          # A delayed run may have pushed first; rebase rather than fail.
+          for attempt in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+            echo "Push rejected, rebasing (attempt $attempt)"
+            git pull --rebase --autostash
+          done
+          echo "Could not push state after 3 attempts" >&2
+          exit 1

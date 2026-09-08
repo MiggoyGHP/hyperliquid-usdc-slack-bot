@@ -1,0 +1,14 @@
+[project]
+name = "hl-usdc-bot"
+version = "1.0.0"
+requires-python = ">=3.12"
+# Intentionally empty: the Cloudflare Worker path uses only the standard
+# library. pywrangler vendors what is listed here, so keeping it empty keeps
+# requests / flask / google-cloud-storage out of the Worker bundle.
+# Those are CPython-only and live in requirements.txt.
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"

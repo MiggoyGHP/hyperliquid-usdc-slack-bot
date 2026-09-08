@@ -1,0 +1,29 @@
+{
+  "name": "hl-usdc-bot",
+  "main": "worker.py",
+  "compatibility_date": "2026-09-08",
+  "compatibility_flags": ["python_workers"],
+
+  // Hourly. The bot itself decides whether a given tick is worth a message.
+  "triggers": {
+    "crons": ["5 * * * *"]
+  },
+
+  // Create with: npx wrangler kv namespace create HL_BOT_STATE
+  // then paste the returned id here.
+  "kv_namespaces": [
+    { "binding": "HL_BOT_STATE", "id": "<PASTE_KV_NAMESPACE_ID>" }
+  ],
+
+  // SLACK_WEBHOOK_URL is a secret, NOT a var:
+  //   npx wrangler secret put SLACK_WEBHOOK_URL
+  "vars": {
+    "HEARTBEAT_HOURS": "6",
+    "ESCALATED_INTERVAL_HOURS": "1",
+    "ESCALATE_AT": "0.79",
+    "TOKEN_INDEX": "0",
+    "DISPLAY_TIMEZONE": "Asia/Manila",
+    "DISPLAY_UTC_OFFSET_HOURS": "8",
+    "STATE_OBJECT": "state.json"
+  }
+}
