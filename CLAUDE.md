@@ -29,11 +29,9 @@ environment variables take precedence over it. Passing an explicit mapping
 webhook out of test runs, so keep writing tests that way.
 
 Deployment is fully scripted in README.md — do not re-derive those commands. The primary
-target is an Oracle Cloud VM running `deploy/bootstrap.sh` (systemd timer + the ordinary
-CPython path); Cloudflare Workers and Cloud Run are documented alternatives.
-
-`deploy/bootstrap.sh` is idempotent and is the only supported way to install or update
-the VM. It syncs `hl_usdc_bot/` only — never tests, `.env`, or `state.json`.
+target is **GitHub Actions** (`.github/workflows/tick.yml`) on the public repo
+`MiggoyGHP/hyperliquid-usdc-slack-bot`. Cloudflare Workers, Cloud Run and an Oracle VM
+are documented alternatives.
 
 `worker.py` cannot be imported by CPython (`workers`, `js`, `pyodide` exist only inside
 the Workers runtime), so it is not covered by the suite. Keep it thin: anything with
@@ -75,6 +73,18 @@ Bands have a 1.5-point exit buffer (`bands.EXIT_BUFFER`): entering `HIGH` needs 
 leaving it needs < 78.5%. Without this, a reading hovering at 80.00% alerts every tick.
 The 78.5% exit sitting below the 79% cadence trigger is intentional — cadence must calm
 down before the band does, never the reverse.
+
+## This repository is public
+
+- **The Slack webhook is a bearer credential and lives only in GitHub Secrets**
+  (`SLACK_WEBHOOK_URL`). It must never appear in the workflow file, in tracked files, or
+  in a log. `.env` holds it locally and is gitignored — keep it that way.
+- **`state.json` is deliberately NOT gitignored.** The workflow commits it every run, and
+  that commit is what stops GitHub disabling the schedule after 60 days of inactivity.
+  Re-adding it to `.gitignore` would silently kill the bot two months later. It holds only
+  a timestamp, a utilization figure and a band name — nothing sensitive.
+- The workflow rebases and retries on push conflicts, because a delayed run can overlap a
+  newer one. `concurrency` limits that, but does not eliminate it.
 
 ## Invariants that have already caused bugs
 
@@ -122,4 +132,8 @@ down before the band does, never the reverse.
   GCS client are not needed there and are deliberately absent.
 - The systemd timer sets `Persistent=true`, so a reboot replays the missed tick. That is
   safe precisely because `decide` is time-based rather than run-count-based: a catch-up
-  tick produces at most one message, not a backlog.
+  tick produces at most one message, not a backlog. The same property is why GitHub's
+  dropped scheduled runs are harmless.
+- Default cadence is hourly (`heartbeat_hours = 1`). With `ESCALATED_INTERVAL_HOURS` also
+  1, the `ESCALATE_AT` escalation rule is currently inert — it only does work if the
+  heartbeat is raised above 1.
