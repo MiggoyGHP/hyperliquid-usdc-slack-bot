@@ -1,8 +1,8 @@
 # Hyperliquid USDC Utilization → Slack
 
-Posts the utilization rate of Hyperliquid's native USDC borrow/lend market to Slack:
-a routine heartbeat while things are calm, escalating to hourly updates and louder
-alerts as utilization approaches and crosses the 80% rate kink.
+Posts the utilization rate of Hyperliquid's native USDC borrow/lend market to Slack
+every two hours, with spot BTC and ETH alongside it for context and a louder alert as
+utilization approaches and crosses the 80% rate kink.
 
 ## Why 80% matters
 
@@ -30,18 +30,25 @@ straight to `Decimal` — never through `float`.
 
 ## Behaviour
 
-Two independent rules. Cloud Scheduler ticks hourly; the bot decides whether that
-tick is worth a message.
+Two independent rules. Cloud Scheduler ticks every two hours; the bot decides whether
+that tick is worth a message.
 
 **Cadence — how often it posts**
 
 | Utilization | Posts every |
 |---|---|
-| any | 1 hour |
+| any | 2 hours |
 
-Set `HEARTBEAT_HOURS` higher for a quieter channel; `ESCALATE_AT` then switches to
+In the deployed job the cron *is* the cadence — see
+[Cadence: `HEARTBEAT_HOURS=0`](#cadence-heartbeat_hours0-in-the-deployed-job). Elsewhere,
+set `HEARTBEAT_HOURS` higher for a quieter channel; `ESCALATE_AT` then switches to
 `ESCALATED_INTERVAL_HOURS` above that utilization. With both set to 1 (the default) the
 escalation rule is inert and every tick posts.
+
+**Spot majors — context, not a rule.** Each posted message carries the BTC and ETH spot
+mids captured on that tick, read from Hyperliquid's own `BTC/USDC` and `ETH/USDC` markets
+(`UBTC`/`UETH` against USDC). They never influence whether a tick posts. The read happens
+only on a tick that will post, and a failure costs the two fields rather than the message.
 
 **Severity band — how loud the post is.** A band *change* posts immediately,
 regardless of cadence.
@@ -61,7 +68,7 @@ cadence calms down before the band does, never the reverse.
 
 ```
 hl_usdc_bot/
-  hyperliquid.py  read the reserve state; Decimal parsing, strict validation
+  hyperliquid.py  read the reserve state + spot majors; Decimal parsing, validation
   rates.py        borrow curve, headroom to the kink, $ and % formatting
   bands.py        severity bands + hysteresis
   decide.py       PURE: (reading, prev state, now, config) -> Decision
@@ -73,7 +80,7 @@ hl_usdc_bot/
   config.py       environment -> frozen Config
 wsgi.py           gunicorn entrypoint (unused by the deployed job)
 deploy/
-  setup.ps1       provision the Cloud Run job + hourly trigger, idempotent
+  setup.ps1       provision the Cloud Run job + two-hourly trigger, idempotent
   set-webhook.ps1 write/rotate the webhook in Secret Manager
   env.yaml        non-secret job configuration
 ```
@@ -100,10 +107,12 @@ It prints the exact Slack payload it would send. Run it twice — the second run
 should report `SUPPRESSED`, proving the cadence guard works (`HEARTBEAT_HOURS`,
 one hour by default). Delete `state.json` to start over.
 
+The second run also proves the spot-price read is skipped when nothing will be posted.
+
 ## Deploying on Google Cloud
 
-A **Cloud Run Job** triggered hourly by **Cloud Scheduler**, with the webhook in **Secret
-Manager** and the bot's state in a **Cloud Storage** bucket.
+A **Cloud Run Job** triggered every two hours by **Cloud Scheduler**, with the webhook in
+**Secret Manager** and the bot's state in a **Cloud Storage** bucket.
 
 A Job rather than a Service because `tick_once.py` is already a batch entrypoint that runs
 and exits, so no HTTP wrapper is needed — and because Scheduler's `:run` call returns the
@@ -126,8 +135,8 @@ this repository's own history are the record:
 16:30 → 19:47 → 22:28 → 00:45 UTC     gaps of 3h17m, 2h41m, 2h17m against a 1h target
 ```
 
-Cloud Scheduler fires within a few seconds of the hour, so a single hourly poll now does
-what six could not.
+Cloud Scheduler fires within a few seconds of the hour, so a single poll per interval now
+does what six could not.
 
 ### 1. Slack webhook
 
@@ -166,8 +175,8 @@ Copy the webhook URL to the clipboard, then:
 
 It enables the six required APIs, reads the webhook from the clipboard and stores it in
 Secret Manager, creates two service accounts and the state bucket, builds and deploys the
-job, and creates the hourly trigger. It is idempotent — re-run it after a failure or a code
-change.
+job, and creates the two-hourly trigger. It is idempotent — re-run it after a failure or a
+code change.
 
 `-DryRun` deploys with `DRY_RUN=1`, so the job renders the payload into Cloud Logging and
 posts nothing. `-SeedState` uploads the repository's `state.json` to the bucket, but only
@@ -226,19 +235,19 @@ gcloud run jobs describe hl-usdc-tick --region asia-southeast1
 Cloud Run's filesystem is ephemeral. `build_store()` selects `GcsStateStore` when
 `STATE_BUCKET` is set and **silently falls back to a local file when it is not** — which on
 Cloud Run means every tick reads no state, decides `FIRST_RUN`, and posts. The symptom is a
-channel full of duplicates, an hour apart, forever. `setup.ps1` sets the variable twice
+channel full of duplicates, one per tick, forever. `setup.ps1` sets the variable twice
 (once in `deploy/env.yaml`, once as an explicit override derived from `-Project`) and then
 verifies it landed in the deployed spec.
 
 There is no locking or compare-and-swap on the GCS object. That is safe here because
-exactly one tick runs at a time: the schedule is hourly, a tick takes about three seconds,
-and the job is deployed with `--max-retries 0`.
+exactly one tick runs at a time: the schedule is two-hourly, a tick takes about three
+seconds, and the job is deployed with `--max-retries 0`.
 
 ### Why `--max-retries 0`
 
 Unusual for a scheduled job, and deliberate. Walk the failure modes:
 
-- **The Hyperliquid read fails.** Nothing posted, nothing saved. The next hourly tick
+- **The Hyperliquid read fails.** Nothing posted, nothing saved. The next tick
   recovers, and no crossing is lost — `decide` compares the *live* band against the
   *stored* one, so a crossing is delayed, never dropped.
 - **The Slack post fails.** `run_tick_async` raises before `store.save()`, so state stays
@@ -253,19 +262,25 @@ double-run a tick that has already started.
 ### Cadence: `HEARTBEAT_HOURS=0` in the deployed job
 
 `decide` suppresses a tick when `now - last_post_ts < interval`, and `runner` records
-`last_post_ts` at tick *start*. Hourly cron plus `HEARTBEAT_HOURS=1` puts those two values
-almost exactly an hour apart, so a second or two of scheduler jitter decides whether the
-delta clears the interval — and roughly every other hour it does not. The bot would post
-every two hours, unpredictably. The old 10-minute poll masked this.
+`last_post_ts` at tick *start*. A cron set to the same period as the interval puts those
+two values almost exactly one interval apart, so a second or two of scheduler jitter
+decides whether the delta clears it — and roughly every other run it does not. The bot
+would post at twice the intended gap, unpredictably. The old 10-minute poll masked this.
 
 `deploy/env.yaml` therefore sets both interval knobs to `0`, which makes the check always
-pass, so cadence is exactly the cron: one post per hour, deterministically. The guard is
-not gone, it has moved to Cloud Scheduler — which, unlike GitHub's queue, is punctual
-enough to be the thing that governs the rate.
+pass, so cadence is exactly the cron: one post every two hours, deterministically. The
+guard is not gone, it has moved to Cloud Scheduler — which, unlike GitHub's queue, is
+punctual enough to be the thing that governs the rate.
 
 **If you ever make the cron faster than the intended post rate, put the real number back.**
 That is what the guard is for, and the two knobs remain independent: the cron is how often
 the bot *looks*, `HEARTBEAT_HOURS` is how often it is *allowed to post*.
+
+Two consequences of leaning on the cron, both accepted when the team asked for a quieter
+channel. A band crossing is only seen at the next poll, so an 80% or 90% alert can arrive
+up to two hours late. And `ESCALATE_AT` cannot post more often than the cron does, so the
+escalation rule is inert; restoring it means giving both knobs real values and living with
+the jitter above.
 
 ### Operating it
 
@@ -274,6 +289,8 @@ gcloud run jobs executions list --job hl-usdc-tick --region asia-southeast1
 gcloud run jobs execute hl-usdc-tick --region asia-southeast1 --wait  # force one now
 gcloud scheduler jobs pause  hl-usdc-tick-hourly --location asia-southeast1
 gcloud scheduler jobs resume hl-usdc-tick-hourly --location asia-southeast1
+# ^ named when the trigger was hourly; it now fires every two hours. Renaming it
+#   would leave the original job firing as well, which is why it kept the name.
 gcloud storage cat gs://<project>-hl-usdc-state/state.json            # what it remembers
 .\deploy\set-webhook.ps1 -Project <project>                           # rotate the webhook
 
@@ -309,7 +326,7 @@ Oracle reclaims Always Free compute instances that look idle. An instance is jud
 when, over a rolling 7-day window, **95th-percentile CPU is under 20% and network is
 under 20%** (plus memory under 20% on Ampere A1 shapes).
 
-This bot runs for about three seconds an hour. It sits near 0% on every one of those
+This bot runs for about three seconds every two hours. It sits near 0% on every one of those
 metrics, which makes it a textbook reclamation candidate. Oracle also halved the Always
 Free A1 allowance in June 2026 (4 OCPU/24 GB → 2 OCPU/12 GB) with no announcement.
 
@@ -463,7 +480,7 @@ and live in `requirements.txt`, which Python Workers does not read.
 
 ### 5. Confirm it works
 
-Exercise the cron path locally without waiting an hour:
+Exercise the cron path locally without waiting for the next tick:
 
 ```bash
 uvx --from workers-py pywrangler dev
@@ -478,7 +495,7 @@ npx wrangler tail
 ```
 
 Expect a log line like `utilization=0.6449 band=NORMAL reason=FIRST_RUN post=True` and
-one Slack message. The next tick an hour later must log `reason=SUPPRESSED post=False`
+one Slack message. The next tick two hours later must log `reason=SUPPRESSED post=False`
 and send nothing — that second tick is the real test, because it proves state is
 round-tripping through KV.
 

@@ -17,7 +17,7 @@ from pyodide.ffi import to_js as _to_js
 from workers import Response, WorkerEntrypoint
 
 from hl_usdc_bot.config import Config
-from hl_usdc_bot.hyperliquid import API_URL, parse_reserve_state
+from hl_usdc_bot.hyperliquid import API_URL, parse_reserve_state, parse_spot_prices
 from hl_usdc_bot.runner import run_tick_async
 from hl_usdc_bot.slack import SlackPostFailed
 from hl_usdc_bot.state import KvStateStore
@@ -49,6 +49,14 @@ async def fetch_reserve(token=0):
     return parse_reserve_state(json.loads(await response.text()))
 
 
+async def fetch_prices():
+    """Stands in for hyperliquid.fetch_spot_prices, same reason as above."""
+    response = await _post_json(API_URL, {"type": "spotMetaAndAssetCtxs"})
+    if response.status != 200:
+        raise RuntimeError(f"Hyperliquid returned {response.status}")
+    return parse_spot_prices(json.loads(await response.text()))
+
+
 async def post_webhook(payload, url, **_):
     """Stands in for slack.post_webhook, raising the same exception type."""
     response = await _post_json(url, payload)
@@ -60,7 +68,11 @@ async def tick(env):
     config = Config.from_bindings(env)
     store = KvStateStore(env.HL_BOT_STATE, key=config.state_object)
     return await run_tick_async(
-        config, store, fetch_reserve=fetch_reserve, post=post_webhook
+        config,
+        store,
+        fetch_reserve=fetch_reserve,
+        fetch_prices=fetch_prices,
+        post=post_webhook,
     )
 
 

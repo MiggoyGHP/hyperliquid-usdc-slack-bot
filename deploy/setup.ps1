@@ -1,12 +1,12 @@
 <#
 .SYNOPSIS
-    Provision the hourly Hyperliquid USDC utilization bot on Google Cloud.
+    Provision the two-hourly Hyperliquid USDC utilization bot on Google Cloud.
 
 .DESCRIPTION
     Creates, in one project: a Secret Manager secret holding the Slack webhook,
     two service accounts, a GCS bucket for the bot's state, a Cloud Run Job
     built from this repository, and a Cloud Scheduler job that triggers it
-    hourly.
+    every two hours.
 
     A Job rather than a Service because tick_once.py is already a batch
     entrypoint that runs and exits, so no HTTP wrapper is needed -- and because
@@ -42,6 +42,11 @@ param(
     [string]$Region = "asia-southeast1",
 
     [string]$Job = "hl-usdc-tick",
+
+    # Named when the trigger was hourly, and deliberately left that way: renaming
+    # it would create a second scheduler job and leave the original one firing,
+    # which is two alerts an hour rather than one every two. The --description
+    # below is what the console shows, so the stale name misleads nobody.
     [string]$SchedulerJob = "hl-usdc-tick-hourly",
 
     # Distinct from the perp-premiums bot's 'slack-webhook-url'. The two bots
@@ -53,7 +58,8 @@ param(
     [string]$Bucket = "",
     [string]$StateObject = "state.json",
 
-    [string]$Schedule = "0 * * * *",
+    # Every two hours on the hour. This cron IS the post rate -- see deploy/env.yaml.
+    [string]$Schedule = "0 */2 * * *",
     [string]$TimeZone = "Asia/Manila",
 
     # Deploy with DRY_RUN=1: render and log the payload, post nothing.
@@ -235,7 +241,7 @@ Invoke-GCloud @logBinding
 # --- 4. State ---------------------------------------------------------------
 # The bot remembers last_post_ts and last_band between ticks. Cloud Run's
 # filesystem is ephemeral, so that has to live somewhere else, or the bot
-# forgets its band every hour and re-fires crossings it has already announced.
+# forgets its band every tick and re-fires crossings it has already announced.
 Write-Step "State bucket"
 if (Test-Exists storage buckets describe "gs://$Bucket" --project $Project) {
     Write-Host "    gs://$Bucket exists."
@@ -288,7 +294,7 @@ if ($SeedState) {
 #
 # --max-retries 0, unlike the perp-premiums job, which uses 2. Walk the failure
 # modes. A failed Hyperliquid read posts nothing and saves nothing, so the next
-# hourly tick recovers and no crossing is lost -- decide() compares the live
+# tick recovers and no crossing is lost -- decide() compares the live
 # band against the stored one, so a crossing is delayed, never dropped. A failed
 # Slack post raises before store.save(), so state stays put and the next tick
 # retries by itself. The only case a retry would change is a Slack post that
@@ -338,13 +344,14 @@ Invoke-GCloud @invokerBinding
 # slow tick can never cause the scheduler to retry mid-flight. These retries
 # cover a genuinely failed enqueue -- they cannot double-run a tick that has
 # already started, which is what --max-retries on the job governs.
-Write-Step "Hourly trigger"
+Write-Step "Two-hourly trigger"
 $uri = "https://$Region-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$Project/jobs/${Job}:run"
 $schedulerArgs = @(
     "--location", $Region,
     "--project", $Project,
     "--schedule", $Schedule,
     "--time-zone", $TimeZone,
+    "--description", "Runs the hl-usdc-tick job every two hours",
     "--uri", $uri,
     "--http-method", "POST",
     "--oauth-service-account-email", $SchedulerSa,
@@ -364,14 +371,14 @@ Invoke-GCloud @schedulerCmd
 
 # --- 7. The two things that fail silently ------------------------------------
 # Without STATE_BUCKET the job falls back to a local file on an ephemeral disk,
-# reads no state, decides FIRST_RUN and posts -- every hour, forever. And a
+# reads no state, decides FIRST_RUN and posts -- every tick, forever. And a
 # webhook that landed as a literal rather than a secret reference is readable by
 # anyone who can describe the job. Neither shows up as an error at deploy time.
 Write-Step "Verifying the job spec"
 $spec = (& gcloud run jobs describe $Job --region $Region --project $Project --format=json) | Out-String
 if ($spec -notmatch "STATE_BUCKET") {
     throw ("STATE_BUCKET is not in the deployed job spec. The bot would use an " +
-        "ephemeral local file and post FIRST_RUN every hour. Do not go live.")
+        "ephemeral local file and post FIRST_RUN every tick. Do not go live.")
 }
 if ($spec -match "hooks\.slack\.com") {
     throw ("The webhook appears as a literal value in the job spec rather than a " +

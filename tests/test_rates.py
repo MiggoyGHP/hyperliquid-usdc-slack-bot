@@ -1,6 +1,12 @@
 from decimal import Decimal
 
-from hl_usdc_bot.rates import borrow_apy_model, fmt_pct, fmt_usd, headroom_to_kink
+from hl_usdc_bot.rates import (
+    borrow_apy_model,
+    fmt_pct,
+    fmt_price,
+    fmt_usd,
+    headroom_to_kink,
+)
 
 # Hyperliquid docs: borrow_apy = 0.05 + 4.75 * max(0, utilization - 0.80)
 
@@ -49,3 +55,21 @@ def test_fmt_usd_uses_thousands_for_small_amounts():
 
 def test_fmt_usd_keeps_a_negative_sign():
     assert fmt_usd(Decimal("-50000000")) == "-$50.00M"
+
+
+def test_fmt_price_groups_thousands_and_always_shows_cents():
+    assert fmt_price(Decimal("79063.5")) == "$79,063.50"
+
+
+def test_fmt_price_leaves_sub_thousand_prices_ungrouped():
+    assert fmt_price(Decimal("2503.65")) == "$2,503.65"
+    assert fmt_price(Decimal("86.1935")) == "$86.19"
+
+
+def test_fmt_price_rounds_half_up_rather_than_to_even():
+    assert fmt_price(Decimal("0.005")) == "$0.01"
+
+
+def test_fmt_price_does_not_abbreviate_the_way_fmt_usd_does():
+    # fmt_usd would render this '$79.06K', which is nonsense for a price.
+    assert "K" not in fmt_price(Decimal("79063.5"))

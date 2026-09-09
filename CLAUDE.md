@@ -46,8 +46,9 @@ local check available for it.
 
 ## Architecture
 
-A scheduler fires hourly → `runner.run_tick_async` reads Hyperliquid, loads prior state,
-calls `decide`, posts to Slack if warranted, then saves state. The scheduler is a systemd
+A scheduler fires every two hours → `runner.run_tick_async` reads Hyperliquid, loads
+prior state, calls `decide`, reads the spot majors if the tick will post, posts to Slack,
+then saves state. The scheduler is a systemd
 timer on the VM, a Cron Trigger on Cloudflare, or Cloud Scheduler on Cloud Run; the
 orchestration is identical in all three.
 
@@ -65,10 +66,12 @@ glue around it — `app.py` in particular should contain almost no logic.
 
 ### Three orthogonal rules — do not conflate them
 
-- **Polling** (the Cloud Scheduler cron, hourly at `:00`) controls *how often we look*. It
+- **Polling** (the Cloud Scheduler cron, `0 */2 * * *`) controls *how often we look*. It
   cannot raise Slack volume by itself: `decide` suppresses anything not due. The Actions
   host polled every 10 minutes to get six chances at beating GitHub's queue; Cloud
-  Scheduler is punctual, so one poll an hour does what six could not.
+  Scheduler is punctual, so one poll per interval does what six could not. The cost of
+  leaning on the cron is that a band crossing is only seen at the next poll — up to two
+  hours late. That was accepted deliberately when the team asked for a quieter channel.
 - **Cadence** (`heartbeat_hours`, `escalated_interval_hours`, and `escalate_at` at 0.79)
   controls *how often* to post: the minimum gap between messages, and the shorter gap
   that applies once utilization reaches 79%. **Both are `0` in the deployed job** — see
@@ -136,11 +139,23 @@ down before the band does, never the reverse.
 - **`HEARTBEAT_HOURS` and `ESCALATED_INTERVAL_HOURS` are `0` in the deployed job, and the
   cron is what governs the post rate.** `decide` suppresses when
   `now - last_post_ts < interval` and `runner` stamps `last_post_ts` at tick *start*, so
-  an hourly cron against a 1-hour interval lands within seconds of the boundary and a
-  little scheduler jitter decides it — roughly every other hour would suppress, and the
-  bot would post every two hours. Zero makes the check always pass. **If the cron is ever
-  made faster than the intended post rate, put a real interval back in the same change**,
-  or every poll becomes a message.
+  a cron set to the same period as the interval lands within seconds of the boundary and
+  a little scheduler jitter decides it — roughly every other run would suppress, and the
+  bot would post at twice the intended gap. Zero makes the check always pass. **If the
+  cron is ever made faster than the intended post rate, put a real interval back in the
+  same change**, or every poll becomes a message. The corollary: with both at `0`,
+  `ESCALATE_AT` cannot buy a shorter gap than the cron, so the escalation rule is inert.
+- **The spot-price read is best-effort and must stay that way.**
+  `runner._read_prices` swallows every exception and posts without the BTC/ETH fields.
+  Utilization is the alert; the prices are context, and failing the tick to save two
+  fields would trade the message for the decoration. It is also only called once `decide`
+  has returned `should_post`, so a quiet tick costs exactly what it did before prices
+  existed. This is the opposite of the Slack rule directly above — deliberately.
+- **Spot pairs are resolved by token name (`UBTC`/`USDC`), never by the `@142`/`@151`
+  index.** The indices are what the API returns today, and an index that came to mean a
+  different market would put a plausible, wrong price in the alert — `UBTC/USDH`, a stale
+  pair quoting the same asset at a different price, sits a few rows away in the same
+  response. Name resolution turns that failure into a missing field, which is visible.
 - **`GcsStateStore.load` catches only `NotFound`.** Other GCS errors propagate on purpose:
   treating a transient failure as "first run" would post a spurious heartbeat and discard
   the tracked band.

@@ -6,6 +6,7 @@ import pytest
 
 from hl_usdc_bot.bands import Band
 from hl_usdc_bot.decide import Reason
+from hl_usdc_bot.hyperliquid import SpotPrices
 from hl_usdc_bot.runner import run_tick
 from hl_usdc_bot.slack import SlackPostFailed
 from hl_usdc_bot.state import BotState, LocalFileStateStore
@@ -141,3 +142,68 @@ def test_a_crossing_is_posted_even_moments_after_the_last_post(tmp_path):
     assert result.posted
     assert result.reason is Reason.BAND_UPGRADE
     assert "Crossed 80%" in str(poster.payloads[0])
+
+
+class RecordingPrices:
+    """A stand-in for hyperliquid.fetch_spot_prices that counts its calls."""
+
+    def __init__(self, prices=None, fails=False):
+        self.prices = prices or SpotPrices(btc=Decimal("79063.5"), eth=Decimal("2503.65"))
+        self.fails = fails
+        self.calls = 0
+
+    def __call__(self, **_):
+        self.calls += 1
+        if self.fails:
+            raise RuntimeError("Hyperliquid said no")
+        return self.prices
+
+
+def test_a_posted_message_carries_the_prices_captured_this_tick(tmp_path):
+    poster = RecordingPoster()
+
+    run_tick(
+        CONFIG,
+        store_at(tmp_path, None),
+        now=NOW,
+        fetch_reserve=lambda **_: reading("0.64"),
+        fetch_prices=RecordingPrices(),
+        post=poster,
+    )
+
+    assert "$79,063.50" in str(poster.payloads[0])
+
+
+def test_a_failed_price_read_still_posts_the_utilization_alert(tmp_path):
+    # Prices are context; the alert is about USDC. Losing one must not lose the other.
+    poster = RecordingPoster()
+    store = store_at(tmp_path, None)
+
+    result = run_tick(
+        CONFIG,
+        store,
+        now=NOW,
+        fetch_reserve=lambda **_: reading("0.64"),
+        fetch_prices=RecordingPrices(fails=True),
+        post=poster,
+    )
+
+    assert result.posted
+    assert "BTC spot" not in str(poster.payloads[0])
+    assert store.load().last_post_ts == NOW
+
+
+def test_a_suppressed_tick_never_reads_prices(tmp_path):
+    # A quiet tick must cost exactly what it cost before prices existed.
+    prices = RecordingPrices()
+
+    run_tick(
+        CONFIG,
+        store_at(tmp_path, posted(timedelta(hours=1), "0.63", Band.NORMAL)),
+        now=NOW,
+        fetch_reserve=lambda **_: reading("0.64"),
+        fetch_prices=prices,
+        post=RecordingPoster(),
+    )
+
+    assert prices.calls == 0

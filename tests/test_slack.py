@@ -6,6 +6,7 @@ import pytest
 from hl_usdc_bot.bands import Band
 from hl_usdc_bot.config import Config
 from hl_usdc_bot.decide import decide
+from hl_usdc_bot.hyperliquid import SpotPrices
 from hl_usdc_bot.slack import SlackPostFailed, build_message, post_webhook
 from hl_usdc_bot.state import BotState
 from tests.test_decide import CONFIG, NOW, posted, reading
@@ -20,9 +21,12 @@ def all_text(payload) -> str:
     return str(payload)
 
 
-def message_for(utilization: str, previous: BotState, now=NOW, config=CONFIG):
+PRICES = SpotPrices(btc=Decimal("79063.5"), eth=Decimal("2503.65"))
+
+
+def message_for(utilization: str, previous: BotState, now=NOW, config=CONFIG, prices=None):
     read = reading(utilization)
-    return build_message(decide(read, previous, now, config), read, now, config)
+    return build_message(decide(read, previous, now, config), read, now, config, prices)
 
 
 def test_headline_carries_the_utilization():
@@ -159,3 +163,38 @@ def test_post_webhook_raises_on_a_rejected_payload():
 
     with pytest.raises(SlackPostFailed):
         post_webhook({"text": "hello"}, "https://hooks.slack.example/abc", session=session)
+
+
+def test_spot_prices_are_reported_when_they_were_captured():
+    payload = message_for("0.64", BotState.empty(), prices=PRICES)
+
+    text = all_text(payload)
+    assert "BTC spot" in text
+    assert "$79,063.50" in text
+    assert "ETH spot" in text
+    assert "$2,503.65" in text
+
+
+def test_a_message_without_prices_carries_no_price_fields():
+    # The price read is best-effort; losing it must not distort the alert.
+    payload = message_for("0.64", BotState.empty())
+
+    text = all_text(payload)
+    assert "BTC spot" not in text
+    assert "ETH spot" not in text
+
+
+def test_a_half_resolved_price_reading_reports_only_the_leg_it_has():
+    payload = message_for(
+        "0.64", BotState.empty(), prices=SpotPrices(btc=Decimal("79063.5"), eth=None)
+    )
+
+    text = all_text(payload)
+    assert "BTC spot" in text
+    assert "ETH spot" not in text
+
+
+def test_prices_do_not_displace_the_utilization_headline():
+    payload = message_for("0.6410374822", BotState.empty(), prices=PRICES)
+
+    assert "64.10%" in payload["text"]

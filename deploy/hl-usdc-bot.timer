@@ -1,9 +1,9 @@
 [Unit]
-Description=Run the Hyperliquid USDC bot hourly
+Description=Run the Hyperliquid USDC bot every two hours
 
 [Timer]
-# Hourly at :05, matching the cron convention used by the other deploy targets.
-OnCalendar=*-*-* *:05:00
+# Every two hours at :05, matching the cron used by the other deploy targets.
+OnCalendar=*-*-* 0/2:05:00
 
 # Catch up after a reboot or a suspended VM instead of silently skipping.
 # The bot's own cadence logic then decides whether that tick warrants a post.

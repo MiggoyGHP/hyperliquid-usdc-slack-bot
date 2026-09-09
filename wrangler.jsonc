@@ -4,9 +4,10 @@
   "compatibility_date": "2026-09-08",
   "compatibility_flags": ["python_workers"],
 
-  // Hourly. The bot itself decides whether a given tick is worth a message.
+  // Every two hours, matching the deployed Cloud Run schedule. The bot itself
+  // decides whether a given tick is worth a message.
   "triggers": {
-    "crons": ["5 * * * *"]
+    "crons": ["5 */2 * * *"]
   },
 
   // Create with: npx wrangler kv namespace create HL_BOT_STATE

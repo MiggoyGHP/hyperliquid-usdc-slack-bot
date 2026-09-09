@@ -9,8 +9,8 @@ from decimal import ROUND_HALF_UP, Decimal
 from hl_usdc_bot.bands import Band
 from hl_usdc_bot.config import Config
 from hl_usdc_bot.decide import Decision, Reason
-from hl_usdc_bot.hyperliquid import ReserveState
-from hl_usdc_bot.rates import KINK, fmt_pct, fmt_usd, headroom_to_kink
+from hl_usdc_bot.hyperliquid import ReserveState, SpotPrices
+from hl_usdc_bot.rates import KINK, fmt_pct, fmt_price, fmt_usd, headroom_to_kink
 
 DEFAULT_TIMEOUT_SECONDS = 10
 
@@ -55,8 +55,13 @@ def build_message(
     reading: ReserveState,
     now: datetime,
     config: Config,
+    prices: SpotPrices | None = None,
 ) -> dict:
-    """The full webhook body for this decision."""
+    """The full webhook body for this decision.
+
+    `prices` is optional because the spot read is best-effort: a message without
+    it is the same message, minus two fields.
+    """
     utilization = fmt_pct(reading.utilization)
     blocks: list[dict] = [
         {
@@ -70,6 +75,14 @@ def build_message(
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": banner}})
 
     blocks.append({"type": "section", "fields": _fields(decision, reading)})
+
+    # Their own block rather than two more entries in the grid above: Slack lays
+    # fields out two to a row, so appending them would pair BTC with whatever
+    # happened to precede it and strand ETH on a row of its own whenever the
+    # delta field is present.
+    price_fields = _price_fields(prices)
+    if price_fields:
+        blocks.append({"type": "section", "fields": price_fields})
 
     stamp = now.astimezone(
         resolve_display_tz(config.display_timezone, config.display_utc_offset_hours)
@@ -122,6 +135,19 @@ def _fields(decision: Decision, reading: ReserveState) -> list[dict]:
     else:
         fields.append(_field("Past kink by", fmt_usd(-headroom)))
 
+    return fields
+
+
+def _price_fields(prices: SpotPrices | None) -> list[dict]:
+    """Spot majors as captured on this tick; each leg omitted if unresolved."""
+    if prices is None:
+        return []
+
+    fields = []
+    if prices.btc is not None:
+        fields.append(_field("BTC spot", fmt_price(prices.btc)))
+    if prices.eth is not None:
+        fields.append(_field("ETH spot", fmt_price(prices.eth)))
     return fields
 
 

@@ -51,3 +51,12 @@ def fmt_usd(amount: Decimal) -> str:
             return f"{sign}${scaled}{suffix}"
 
     return f"{sign}${magnitude.quantize(_CENTS, rounding=ROUND_HALF_UP)}"
+
+
+def fmt_price(amount: Decimal) -> str:
+    """2503.65 -> '$2,503.65'. Comma-grouped and always to the cent.
+
+    fmt_usd abbreviates, which is right for a pool balance and nonsense for a
+    price: it would render Bitcoin at '$79.06K'.
+    """
+    return f"${amount.quantize(_CENTS, rounding=ROUND_HALF_UP):,f}"

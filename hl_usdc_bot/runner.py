@@ -12,7 +12,7 @@ from decimal import Decimal
 from hl_usdc_bot.bands import Band
 from hl_usdc_bot.config import Config
 from hl_usdc_bot.decide import Reason, decide
-from hl_usdc_bot.hyperliquid import fetch_reserve_state
+from hl_usdc_bot.hyperliquid import fetch_reserve_state, fetch_spot_prices
 from hl_usdc_bot.slack import build_message, post_webhook
 from hl_usdc_bot.state import BotState
 
@@ -39,17 +39,39 @@ async def _resolve(value):
     return value
 
 
+async def _read_prices(fetch_prices):
+    """The spot majors, best-effort.
+
+    Unlike the Slack post, a failure here must not abort the tick: the alert is
+    about USDC utilization, and losing it to save two decorative fields would be
+    a bad trade. The tick posts without them and says so in the log.
+    """
+    try:
+        return await _resolve(fetch_prices())
+    except Exception:  # noqa: BLE001 - any price failure degrades, never blocks
+        log.warning("spot price read failed; posting without prices", exc_info=True)
+        return None
+
+
 def run_tick(
     config: Config,
     store,
     *,
     now: datetime | None = None,
     fetch_reserve=fetch_reserve_state,
+    fetch_prices=fetch_spot_prices,
     post=post_webhook,
 ) -> TickResult:
     """Run a single tick synchronously. Raises so the caller retries."""
     return asyncio.run(
-        run_tick_async(config, store, now=now, fetch_reserve=fetch_reserve, post=post)
+        run_tick_async(
+            config,
+            store,
+            now=now,
+            fetch_reserve=fetch_reserve,
+            fetch_prices=fetch_prices,
+            post=post,
+        )
     )
 
 
@@ -59,6 +81,7 @@ async def run_tick_async(
     *,
     now: datetime | None = None,
     fetch_reserve=None,
+    fetch_prices=None,
     post=None,
 ) -> TickResult:
     """The one orchestration, shared by CPython and the Cloudflare Worker.
@@ -68,6 +91,8 @@ async def run_tick_async(
     """
     if fetch_reserve is None:
         fetch_reserve = fetch_reserve_state
+    if fetch_prices is None:
+        fetch_prices = fetch_spot_prices
     if post is None:
         post = post_webhook
 
@@ -88,7 +113,9 @@ async def run_tick_async(
     if not decision.should_post:
         return TickResult(False, decision.reason, decision.band, reading.utilization, None)
 
-    payload = build_message(decision, reading, now, config)
+    # Read only on a tick that will post: a suppressed tick then costs exactly
+    # what it cost before prices existed, and adds no failure surface.
+    payload = build_message(decision, reading, now, config, await _read_prices(fetch_prices))
 
     if not config.dry_run:
         # Only advance state once Slack has accepted the message; a failure
