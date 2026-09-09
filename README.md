@@ -98,10 +98,10 @@ start over.
 
 ## Deploying on GitHub Actions
 
-The repository is the deployment. `.github/workflows/tick.yml` runs one tick an hour and
-commits `state.json` back, which is also what keeps the schedule alive — GitHub disables
-cron on repositories with no commits for 60 days, and the state commit resets that timer
-on every run.
+The repository is the deployment. `.github/workflows/tick.yml` polls every 10 minutes and
+commits `state.json` back whenever a tick actually posts, which is also what keeps the
+schedule alive — GitHub disables cron on repositories with no commits for 60 days, and the
+hourly heartbeat's state commit resets that timer.
 
 ### 1. Slack webhook
 
@@ -123,7 +123,7 @@ webhook in the workflow file, in `.env` (gitignored), or anywhere else in the tr
 ### 3. Enable and verify
 
 Actions are enabled by default on new repositories. Trigger a run by hand rather than
-waiting for the hour:
+waiting for the next poll:
 
 ```bash
 gh workflow run "Hyperliquid USDC utilization"
@@ -137,21 +137,31 @@ send nothing, and make no commit.
 
 ### What to expect from the schedule
 
-GitHub runs scheduled workflows **on a best-effort basis**. Delays of 15–60 minutes are
-normal under load, and individual runs are occasionally dropped. "Hourly" means "about
-hourly" — you will see gaps.
+GitHub runs scheduled workflows **on a best-effort basis**. Individual runs are delayed
+15–60 minutes under load and are occasionally dropped outright. Nothing you can put in the
+workflow makes a given run punctual.
 
-That is the trade for zero cost and zero infrastructure. If a post must land at a precise
-minute, Cloudflare Workers or a VM timer are the alternatives documented below.
+So the workflow asks more often instead. It polls at `:03, :13, :23, :33, :43, :53` — every
+10 minutes, deliberately off the top of the hour, where GitHub's queue is most congested.
+With six independent attempts an hour it is the tail that matters rather than any single
+run: for a crossing to go unnoticed for a full hour, all six would have to slip or drop
+together. In practice the alert lands within 10–20 minutes. The runs cost nothing —
+Actions minutes are unlimited on public repositories.
+
+**Polling every 10 minutes is not posting every 10 minutes.** Five of every six runs return
+`SUPPRESSED`, send nothing and commit nothing; you still get roughly one message an hour.
+The two knobs are independent: `cron:` is how often the bot *looks*, `HEARTBEAT_HOURS` is
+how often it *posts*.
 
 Two consequences worth knowing:
 
-- **A dropped run is harmless.** Cadence is driven by the timestamp in `state.json`, not
-  by counting runs, so the next tick simply sees that more than an hour has elapsed and
-  posts. You lose a reading, never the thread.
-- **A band crossing can arrive late.** If utilization crosses 80% at 14:00 and the run
-  slips to 14:45, the alert arrives at 14:45. For a lending pool this is fine; for a
-  liquidation alert it would not be.
+- **A dropped run is harmless.** Cadence is driven by the timestamp in `state.json`, not by
+  counting runs, so the next poll simply sees that the interval has elapsed and posts. You
+  lose a reading, never the thread.
+- **A band crossing can still arrive late**, just far less late. If utilization crosses 80%
+  at 14:00 the alert normally lands by 14:20, though a bad hour can stretch that. For a
+  lending pool this is fine; for a liquidation alert it would not be — use the Cloudflare
+  Worker below, which fires to the minute.
 
 ### Operating it
 
@@ -163,7 +173,9 @@ gh workflow enable  "Hyperliquid USDC utilization"
 gh secret set SLACK_WEBHOOK_URL                    # rotate the webhook
 ```
 
-Change cadence by editing the `env:` block in the workflow and pushing. To force a fresh
+Two knobs, easy to confuse. **How often it posts** is `HEARTBEAT_HOURS` in the workflow's
+`env:` block; **how often it looks** is the `cron:` expression. Raising the poll rate cannot
+increase Slack volume — `decide` suppresses anything that is not due. To force a fresh
 heartbeat, delete `state.json` and commit.
 
 If runs stop appearing, check whether GitHub disabled the schedule for inactivity — the

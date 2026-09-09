@@ -2,9 +2,17 @@ name: Hyperliquid USDC utilization
 
 on:
   schedule:
-    # Hourly at :05. GitHub runs schedules on a best-effort basis and commonly
-    # delays them 15-60 minutes under load, so treat this as "about hourly".
-    - cron: "5 * * * *"
+    # Poll every 10 minutes, deliberately off the top of the hour: GitHub's
+    # scheduled-workflow queue is most congested at :00 and delays there are
+    # worst. Six attempts an hour are six independent chances to beat the
+    # queue, which cuts worst-case crossing latency from ~60 min to ~10-20.
+    #
+    # This does NOT increase Slack volume. Cadence is driven by the timestamp
+    # in state.json (see decide.py), never by run count, so five of every six
+    # runs return SUPPRESSED, post nothing and commit nothing. Raising the
+    # poll rate and raising the post rate are different knobs - the post rate
+    # is HEARTBEAT_HOURS in the env block below.
+    - cron: "3,13,23,33,43,53 * * * *"
   workflow_dispatch:
 
 # Needed to commit state.json back to the repo. That commit is also what keeps
@@ -24,6 +32,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Resolve the branch at run time rather than defaulting to the SHA
+          # the scheduled event was created from. A delayed run must not read
+          # a state.json that a newer run has already superseded: stale state
+          # means a stale last_band, which re-fires a crossing alert that has
+          # already been sent.
+          ref: ${{ github.ref_name }}
 
       - uses: actions/setup-python@v5
         with:

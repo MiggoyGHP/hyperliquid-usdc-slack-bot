@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -172,3 +173,40 @@ def test_state_with_a_timestamp_but_no_previous_band_is_treated_as_first_run():
 
     assert decision.should_post
     assert decision.reason is Reason.FIRST_RUN
+
+
+# Polling frequency and posting frequency are separate knobs. The workflow polls
+# every 10 minutes to shorten the wait for a crossing; these two pin the property
+# that makes that safe, so nobody reverts the cron believing it spams the channel.
+
+# Both hold the previous state fixed across the grid, which is what really happens:
+# a suppressed tick never advances state.
+
+
+def test_polling_faster_than_the_heartbeat_does_not_multiply_posts():
+    hourly = replace(CONFIG, heartbeat_hours=1)
+    quiet = posted(timedelta(0), "0.63", Band.NORMAL)
+
+    reasons = [
+        decide(reading("0.64"), quiet, NOW + timedelta(minutes=m), hourly).reason
+        for m in range(10, 61, 10)
+    ]
+
+    assert reasons == [Reason.SUPPRESSED] * 5 + [Reason.HEARTBEAT]
+
+
+def test_a_crossing_posts_at_the_poll_that_sees_it_not_at_the_heartbeat():
+    hourly = replace(CONFIG, heartbeat_hours=1)
+    quiet = posted(timedelta(0), "0.78", Band.NORMAL)
+    # Utilization crosses the kink between the first poll and the second.
+    climbing = ["0.79", "0.801", "0.802", "0.803", "0.804", "0.805"]
+
+    reasons = [
+        decide(reading(u), quiet, NOW + timedelta(minutes=m), hourly).reason
+        for m, u in zip(range(10, 61, 10), climbing)
+    ]
+
+    # 50 minutes before the heartbeat would have come due. That is the whole
+    # point of the faster cron; an hourly poll would have missed this one.
+    assert reasons[0] is Reason.SUPPRESSED
+    assert reasons[1] is Reason.BAND_UPGRADE

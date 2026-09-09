@@ -57,8 +57,13 @@ no disk. All behaviour changes belong here, driven by tests that pass synthetic 
 directly rather than waiting on real market moves. Everything else in the package is thin
 glue around it — `app.py` in particular should contain almost no logic.
 
-### Two orthogonal rules — do not conflate them
+### Three orthogonal rules — do not conflate them
 
+- **Polling** (the `cron:` in `.github/workflows/tick.yml`, every 10 minutes at `:03`,
+  `:13`, …) controls *how often we look*. It cannot change Slack volume: `decide`
+  suppresses anything not due, so five of every six runs post nothing and commit nothing.
+  A faster poll only shortens the wait for a band crossing, working around GitHub's
+  best-effort scheduler. **Do not "fix" it back to hourly** believing it spams the channel.
 - **Cadence** (`config.escalate_at`, default 0.79) controls *how often* to post: every 6h
   normally, every 1h once utilization reaches 79%.
 - **Severity band** (`bands.py`) controls *how loud* the post is. A band change posts
@@ -66,6 +71,10 @@ glue around it — `app.py` in particular should contain almost no logic.
 
 A reading can escalate cadence while still sitting in the `NORMAL` band — 79% is
 deliberately below the 80% band boundary. That is the design, not a bug.
+
+`test_polling_faster_than_the_heartbeat_does_not_multiply_posts` in `tests/test_decide.py`
+pins the polling property directly, so a faster cron cannot silently become a louder
+channel.
 
 ### Hysteresis
 
@@ -99,6 +108,11 @@ down before the band does, never the reverse.
   leave the previous band intact so the next tick retries instead of swallowing a crossing.
 - **Suppressed ticks must not touch `last_post_ts`.** Restarting the heartbeat clock on
   every quiet tick means the 6-hourly post never comes due.
+- **The Actions checkout pins `ref: ${{ github.ref_name }}`.** Without it `actions/checkout`
+  takes the SHA the scheduled event was *created* from, so a delayed run reads a
+  `state.json` that a newer run already superseded. A stale `last_band` re-fires a crossing
+  alert that was already sent. The exposure scales with the poll rate, which is why this
+  landed alongside the 10-minute cron.
 - **`GcsStateStore.load` catches only `NotFound`.** Other GCS errors propagate on purpose:
   treating a transient failure as "first run" would post a spurious heartbeat and discard
   the tracked band.
