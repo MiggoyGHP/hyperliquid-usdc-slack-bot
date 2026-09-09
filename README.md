@@ -71,7 +71,11 @@ hl_usdc_bot/
   app.py          Flask: POST /tick, GET /healthz
   tick_once.py    same tick, from the command line
   config.py       environment -> frozen Config
-wsgi.py           gunicorn entrypoint
+wsgi.py           gunicorn entrypoint (unused by the deployed job)
+deploy/
+  setup.ps1       provision the Cloud Run job + hourly trigger, idempotent
+  set-webhook.ps1 write/rotate the webhook in Secret Manager
+  env.yaml        non-secret job configuration
 ```
 
 `decide.py` does no I/O — no clock, no network, no disk. That is what makes the
@@ -93,93 +97,206 @@ $env:DRY_RUN="1"; $env:STATE_FILE=".\state.json"
 ```
 
 It prints the exact Slack payload it would send. Run it twice — the second run
-should report `SUPPRESSED`, proving the 6-hour rule works. Delete `state.json` to
-start over.
+should report `SUPPRESSED`, proving the cadence guard works (`HEARTBEAT_HOURS`,
+one hour by default). Delete `state.json` to start over.
 
-## Deploying on GitHub Actions
+## Deploying on Google Cloud
 
-The repository is the deployment. `.github/workflows/tick.yml` polls every 10 minutes and
-commits `state.json` back whenever a tick actually posts, which is also what keeps the
-schedule alive — GitHub disables cron on repositories with no commits for 60 days, and the
-hourly heartbeat's state commit resets that timer.
+A **Cloud Run Job** triggered hourly by **Cloud Scheduler**, with the webhook in **Secret
+Manager** and the bot's state in a **Cloud Storage** bucket.
+
+A Job rather than a Service because `tick_once.py` is already a batch entrypoint that runs
+and exits, so no HTTP wrapper is needed — and because Scheduler's `:run` call returns the
+moment the execution is enqueued. Nothing holds a connection open for the length of the
+tick, so a slow Hyperliquid read can never trip a scheduler deadline and provoke a retry
+that posts twice. That matters more here than it would for a stateless bot: this one
+mutates dedupe state, so a duplicate run is a duplicate alert. `app.py` and `wsgi.py`
+remain in the repository and still work — see [Running elsewhere](#running-elsewhere) — but
+nothing in the deployed path uses them.
+
+### Why this replaced GitHub Actions
+
+GitHub runs scheduled workflows **on a best-effort basis**: individual runs are delayed
+15–60 minutes under load and are occasionally dropped outright, and nothing you can put in
+a workflow makes a given run punctual. The workflow's answer was to poll six times an hour
+so that at least one attempt would beat the queue. It was not enough. The tick commits in
+this repository's own history are the record:
+
+```
+16:30 → 19:47 → 22:28 → 00:45 UTC     gaps of 3h17m, 2h41m, 2h17m against a 1h target
+```
+
+Cloud Scheduler fires within a few seconds of the hour, so a single hourly poll now does
+what six could not.
 
 ### 1. Slack webhook
 
-api.slack.com/apps → **Create New App** → **From scratch** → name it and pick your
-workspace → set the name and icon under **Basic Information → Display Information** (the
-payload cannot override these) → **Incoming Webhooks** → toggle **On** → **Add New
-Webhook to Workspace** → choose the channel → copy the URL.
+api.slack.com/apps → **Create New App** → **From scratch** → name it and pick the workspace
+→ set the name and icon under **Basic Information → Display Information** (the payload
+cannot override these) → **Incoming Webhooks** → toggle **On** → **Add New Webhook to
+Workspace** → choose the channel → copy the `https://hooks.slack.com/services/...` URL.
 
-### 2. Store it as a repository secret
+### 2. Prerequisites
 
-```bash
-gh secret set SLACK_WEBHOOK_URL --repo <owner>/<repo>
+Install the [Google Cloud CLI](https://cloud.google.com/sdk/docs/install), then:
+
+```powershell
+gcloud init
+gcloud auth login
 ```
 
-**The repository is public; the secret is not.** GitHub Secrets are encrypted, hidden
-from logs, and unavailable to workflows triggered by forked pull requests. Never put the
-webhook in the workflow file, in `.env` (gitignored), or anywhere else in the tree.
+If a shell that was already open cannot see `gcloud` after installing it, that is the shell
+holding a pre-install copy of `PATH`. VSCode's integrated terminals inherit the editor's
+environment from when it launched, so a *new* terminal is not enough there — the editor
+itself has to restart. `setup.ps1` sidesteps both by re-reading `PATH` from the registry,
+so it runs fine in a stale shell.
 
-### 3. Enable and verify
+The project needs **billing enabled** — Cloud Build and Artifact Registry refuse to run
+without it. Actual spend is nil; see [Cost](#cost).
 
-Actions are enabled by default on new repositories. Trigger a run by hand rather than
-waiting for the next poll:
+Docker is *not* needed. `--source` hands the build to Cloud Build.
 
-```bash
-gh workflow run "Hyperliquid USDC utilization"
-gh run watch
-gh run view --log
+### 3. Provision
+
+Copy the webhook URL to the clipboard, then:
+
+```powershell
+.\deploy\setup.ps1 -Project <your-project-id> -DryRun -SeedState
 ```
 
-Expect `reason=FIRST_RUN post=True`, one Slack message, and a `chore: record tick …`
-commit. Run it a second time straight away: it must log `reason=SUPPRESSED post=False`,
-send nothing, and make no commit.
+It enables the six required APIs, reads the webhook from the clipboard and stores it in
+Secret Manager, creates two service accounts and the state bucket, builds and deploys the
+job, and creates the hourly trigger. It is idempotent — re-run it after a failure or a code
+change.
 
-### What to expect from the schedule
+`-DryRun` deploys with `DRY_RUN=1`, so the job renders the payload into Cloud Logging and
+posts nothing. `-SeedState` uploads the repository's `state.json` to the bucket, but only
+if the bucket holds none — that carries `last_band` across the migration so the first tick
+does not re-announce a crossing the Actions run already sent.
 
-GitHub runs scheduled workflows **on a best-effort basis**. Individual runs are delayed
-15–60 minutes under load and are occasionally dropped outright. Nothing you can put in the
-workflow makes a given run punctual.
+Check it:
 
-So the workflow asks more often instead. It polls at `:03, :13, :23, :33, :43, :53` — every
-10 minutes, deliberately off the top of the hour, where GitHub's queue is most congested.
-With six independent attempts an hour it is the tail that matters rather than any single
-run: for a crossing to go unnoticed for a full hour, all six would have to slip or drop
-together. In practice the alert lands within 10–20 minutes. The runs cost nothing —
-Actions minutes are unlimited on public repositories.
+```powershell
+gcloud run jobs execute hl-usdc-tick --region asia-southeast1 --wait
+```
 
-**Polling every 10 minutes is not posting every 10 minutes.** Five of every six runs return
-`SUPPRESSED`, send nothing and commit nothing; you still get roughly one message an hour.
-The two knobs are independent: `cron:` is how often the bot *looks*, `HEARTBEAT_HOURS` is
-how often it *posts*.
+Read the payload and the `utilization=… band=… reason=… post=…` line in the logs. Note that
+a dry run still writes state — only the Slack post is skipped — which makes it a real test
+of the bucket wiring:
 
-Two consequences worth knowing:
+```powershell
+gcloud storage cat gs://<your-project-id>-hl-usdc-state/state.json
+```
 
-- **A dropped run is harmless.** Cadence is driven by the timestamp in `state.json`, not by
-  counting runs, so the next poll simply sees that the interval has elapsed and posts. You
-  lose a reading, never the thread.
-- **A band crossing can still arrive late**, just far less late. If utilization crosses 80%
-  at 14:00 the alert normally lands by 14:20, though a bad hour can stretch that. For a
-  lending pool this is fine; for a liquidation alert it would not be — use the Cloudflare
-  Worker below, which fires to the minute.
+A fresh `last_post_ts` there means GCS state is working. When the payload looks right, go
+live:
+
+```powershell
+.\deploy\setup.ps1 -Project <your-project-id>
+gcloud run jobs execute hl-usdc-tick --region asia-southeast1 --wait
+```
+
+That last execution should put exactly one message in the channel.
+
+At the original cutover this was preceded by `gh workflow disable "Hyperliquid USDC
+utilization"`. Running both hosts at once means two bots against two different state
+stores, neither aware of the other's posts — so if the workflow is ever restored,
+disable it again before going live here.
+
+### Two service accounts, not one
+
+`hl-usdc-job` runs the container and may read the secret and the state bucket.
+`hl-usdc-scheduler` may invoke the job and nothing else. Splitting them means the trigger —
+the component reachable from outside — cannot read the webhook.
+
+The webhook is never in the image, in `deploy/env.yaml`, or in a tracked file.
+`.dockerignore` excludes `.env` for the same reason: image layers are readable by anyone
+with pull access. `setup.ps1` asserts both of the things that fail silently here, and
+refuses to finish if either is wrong:
+
+```powershell
+gcloud run jobs describe hl-usdc-tick --region asia-southeast1
+```
+
+`SLACK_WEBHOOK_URL` must appear as a secret reference, never as a literal, and
+`STATE_BUCKET` must be present — see below for what happens if it is not.
+
+### State lives in the bucket, and must
+
+Cloud Run's filesystem is ephemeral. `build_store()` selects `GcsStateStore` when
+`STATE_BUCKET` is set and **silently falls back to a local file when it is not** — which on
+Cloud Run means every tick reads no state, decides `FIRST_RUN`, and posts. The symptom is a
+channel full of duplicates, an hour apart, forever. `setup.ps1` sets the variable twice
+(once in `deploy/env.yaml`, once as an explicit override derived from `-Project`) and then
+verifies it landed in the deployed spec.
+
+There is no locking or compare-and-swap on the GCS object. That is safe here because
+exactly one tick runs at a time: the schedule is hourly, a tick takes about three seconds,
+and the job is deployed with `--max-retries 0`.
+
+### Why `--max-retries 0`
+
+Unusual for a scheduled job, and deliberate. Walk the failure modes:
+
+- **The Hyperliquid read fails.** Nothing posted, nothing saved. The next hourly tick
+  recovers, and no crossing is lost — `decide` compares the *live* band against the
+  *stored* one, so a crossing is delayed, never dropped.
+- **The Slack post fails.** `run_tick_async` raises before `store.save()`, so state stays
+  put and the next tick retries by itself.
+- **Slack succeeds, then the state write fails.** A retry re-reads stale state and posts a
+  duplicate.
+
+The only case a retry would change is the one where it causes a duplicate alert. Cloud
+Scheduler keeps `--max-retry-attempts 3`, but those cover a failed *enqueue* and cannot
+double-run a tick that has already started.
+
+### Cadence: `HEARTBEAT_HOURS=0` in the deployed job
+
+`decide` suppresses a tick when `now - last_post_ts < interval`, and `runner` records
+`last_post_ts` at tick *start*. Hourly cron plus `HEARTBEAT_HOURS=1` puts those two values
+almost exactly an hour apart, so a second or two of scheduler jitter decides whether the
+delta clears the interval — and roughly every other hour it does not. The bot would post
+every two hours, unpredictably. The old 10-minute poll masked this.
+
+`deploy/env.yaml` therefore sets both interval knobs to `0`, which makes the check always
+pass, so cadence is exactly the cron: one post per hour, deterministically. The guard is
+not gone, it has moved to Cloud Scheduler — which, unlike GitHub's queue, is punctual
+enough to be the thing that governs the rate.
+
+**If you ever make the cron faster than the intended post rate, put the real number back.**
+That is what the guard is for, and the two knobs remain independent: the cron is how often
+the bot *looks*, `HEARTBEAT_HOURS` is how often it is *allowed to post*.
 
 ### Operating it
 
-```bash
-gh run list --workflow "Hyperliquid USDC utilization" --limit 10
-gh workflow run "Hyperliquid USDC utilization"     # force a tick
-gh workflow disable "Hyperliquid USDC utilization" # pause alerts
-gh workflow enable  "Hyperliquid USDC utilization"
-gh secret set SLACK_WEBHOOK_URL                    # rotate the webhook
+```powershell
+gcloud run jobs executions list --job hl-usdc-tick --region asia-southeast1
+gcloud run jobs execute hl-usdc-tick --region asia-southeast1 --wait  # force one now
+gcloud scheduler jobs pause  hl-usdc-tick-hourly --location asia-southeast1
+gcloud scheduler jobs resume hl-usdc-tick-hourly --location asia-southeast1
+gcloud storage cat gs://<project>-hl-usdc-state/state.json            # what it remembers
+.\deploy\set-webhook.ps1 -Project <project>                           # rotate the webhook
+
+# redeploy after a code change
+gcloud run jobs deploy hl-usdc-tick --source . --region asia-southeast1
 ```
 
-Two knobs, easy to confuse. **How often it posts** is `HEARTBEAT_HOURS` in the workflow's
-`env:` block; **how often it looks** is the `cron:` expression. Raising the poll rate cannot
-increase Slack volume — `decide` suppresses anything that is not due. To force a fresh
-heartbeat, delete `state.json` and commit.
+To force a fresh heartbeat, delete the state object:
+`gcloud storage rm gs://<project>-hl-usdc-state/state.json`. The next tick reports
+`FIRST_RUN` and posts.
 
-If runs stop appearing, check whether GitHub disabled the schedule for inactivity — the
-Actions tab says so explicitly, and the workflow's own state commits should prevent it.
+The webhook is read as `:latest`, so a rotation takes effect on the next tick with no
+redeploy.
+
+### Sharing a project with another bot
+
+This project also hosts the perp-premiums digest, so every resource here is named
+`hl-usdc-*` and the secret is `hl-usdc-slack-webhook-url` — the other bot owns
+`slack-webhook-url`. The two use **different webhooks pointing at different channels**, and
+crossing them would be silent: each URL is valid, just wrong. If a deploy ever puts this
+bot's messages in the wrong channel, that is the first thing to check.
+
+Cloud Scheduler's free tier covers three jobs per billing account; this is the second.
 
 ## Alternative: Oracle Cloud Always Free VM
 
@@ -393,9 +510,12 @@ Change cadence by editing `vars` in `wrangler.jsonc` and redeploying.
 
 The bot is host-agnostic: `build_store()` picks a state backend from configuration and
 `run_tick_async` awaits whatever its collaborators return. `LocalFileStateStore`,
-`GcsStateStore` (Cloud Run), and `KvStateStore` (Workers) are interchangeable, and
-`app.py` / `wsgi.py` / `Dockerfile` still hold a working Cloud Run deployment if you ever
-want punctual cron with a full CPython runtime.
+`GcsStateStore` (Cloud Run), and `KvStateStore` (Workers) are interchangeable.
+
+`app.py` and `wsgi.py` still hold a working Cloud Run **Service** — an authenticated
+`POST /tick` behind `--no-allow-unauthenticated` — and `tests/test_app.py` still covers
+it. The deployed job does not use them; it runs `tick_once` as a batch container. Build
+the same image and override the entrypoint if you want the Service instead.
 
 ## Configuration
 
@@ -403,8 +523,8 @@ want punctual cron with a full CPython runtime.
 |---|---|---|
 | `SLACK_WEBHOOK_URL` | *(required)* | Incoming webhook. Optional when `DRY_RUN=1`. |
 | `DRY_RUN` | `0` | Print the payload instead of sending it. |
-| `HEARTBEAT_HOURS` | `6` | Quiet-market posting interval. |
-| `ESCALATED_INTERVAL_HOURS` | `1` | Posting interval once escalated. |
+| `HEARTBEAT_HOURS` | `1` | Minimum gap between posts while quiet. `0` in the deployed job. |
+| `ESCALATED_INTERVAL_HOURS` | `1` | Minimum gap once escalated. `0` in the deployed job. |
 | `ESCALATE_AT` | `0.79` | Utilization that switches to the fast cadence. |
 | `STATE_FILE` | `state.json` | Local state path (VM and local dev). |
 | `STATE_BUCKET` | *(unset)* | GCS bucket. When set, overrides `STATE_FILE`. |
@@ -427,20 +547,24 @@ Philippines observes no DST, so a fixed +08:00 is exact.
 
 | Host | State backend | Entry point | Notes |
 |---|---|---|---|
-| **GitHub Actions** | `LocalFileStateStore` (committed) | `.github/workflows/tick.yml` | Primary. Free on public repos; cron drifts. |
+| **Google Cloud Run Job** | `GcsStateStore` | `hl_usdc_bot.tick_once` via Cloud Scheduler | Primary. Punctual to the second; needs billing enabled. |
 | Oracle Cloud VM | `LocalFileStateStore` | `hl_usdc_bot.tick_once` via systemd timer | No caps; idle-reclaim risk. |
 | Cloudflare Workers | `KvStateStore` | `worker.py` | Free forever; 10 ms CPU/invocation on the free plan. |
-| Google Cloud Run | `GcsStateStore` | `wsgi.py` + `Dockerfile` | Punctual; needs billing enabled. |
+| Cloud Run Service | `GcsStateStore` | `wsgi.py` + `app.py` | Same image, different entrypoint. Not deployed. |
 | Anywhere else | `LocalFileStateStore` | `hl_usdc_bot.tick_once` | Any scheduler that can run a command. |
+
+GitHub Actions was the original host and was retired because its scheduled runs drifted
+by hours; see [Why this replaced GitHub Actions](#why-this-replaced-github-actions).
 
 `build_store()` picks the backend from configuration, and `run_tick_async` awaits
 whatever its collaborators return, so sync and async stores are interchangeable.
 
 ## Cost
 
-Zero on the Oracle Always Free tier, and the workload is far below every published limit:
-~730 ticks/month, roughly 3 seconds each, one outbound API call and at most ~24 Slack
-messages a day.
+Effectively nothing on Cloud Run. ~730 ticks/month at roughly 3 seconds each is about 2k
+vCPU-seconds against Cloud Run's 180k free tier; Cloud Scheduler's first three jobs are
+free; the image fits inside Artifact Registry's 0.5 GB free tier. The state object is a
+few hundred bytes. Secret Manager is the only line item that is not zero, at about
+**$0.06/month**.
 
-For reference, if this ran on metered infrastructure it would come to roughly
-**$0.05–0.15/month** in compute.
+Zero on the Oracle Always Free tier, if you would rather not enable billing at all.

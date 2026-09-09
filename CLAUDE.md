@@ -28,10 +28,16 @@ environment variables take precedence over it. Passing an explicit mapping
 (`Config.from_env({...})`) skips `.env` entirely — that is what keeps a developer's real
 webhook out of test runs, so keep writing tests that way.
 
-Deployment is fully scripted in README.md — do not re-derive those commands. The primary
-target is **GitHub Actions** (`.github/workflows/tick.yml`) on the public repo
-`MiggoyGHP/hyperliquid-usdc-slack-bot`. Cloudflare Workers, Cloud Run and an Oracle VM
+Deployment is fully scripted in `deploy/setup.ps1` and documented in README.md — do not
+re-derive those commands. The primary target is a **Cloud Run Job** fired hourly by Cloud
+Scheduler, in project `plucky-vision-508102-k7` / `asia-southeast1`, which it shares with
+the sibling perp-premiums bot. Cloudflare Workers, an Oracle VM and a Cloud Run Service
 are documented alternatives.
+
+GitHub Actions was the original host and was retired in favour of Cloud Run because its
+scheduled runs drifted by hours against a one-hour target. `setup.ps1` is idempotent — to
+ship a code change, re-run it, or `gcloud run jobs deploy hl-usdc-tick --source . --region
+asia-southeast1`.
 
 `worker.py` cannot be imported by CPython (`workers`, `js`, `pyodide` exist only inside
 the Workers runtime), so it is not covered by the suite. Keep it thin: anything with
@@ -59,13 +65,14 @@ glue around it — `app.py` in particular should contain almost no logic.
 
 ### Three orthogonal rules — do not conflate them
 
-- **Polling** (the `cron:` in `.github/workflows/tick.yml`, every 10 minutes at `:03`,
-  `:13`, …) controls *how often we look*. It cannot change Slack volume: `decide`
-  suppresses anything not due, so five of every six runs post nothing and commit nothing.
-  A faster poll only shortens the wait for a band crossing, working around GitHub's
-  best-effort scheduler. **Do not "fix" it back to hourly** believing it spams the channel.
-- **Cadence** (`config.escalate_at`, default 0.79) controls *how often* to post: every 6h
-  normally, every 1h once utilization reaches 79%.
+- **Polling** (the Cloud Scheduler cron, hourly at `:00`) controls *how often we look*. It
+  cannot raise Slack volume by itself: `decide` suppresses anything not due. The Actions
+  host polled every 10 minutes to get six chances at beating GitHub's queue; Cloud
+  Scheduler is punctual, so one poll an hour does what six could not.
+- **Cadence** (`heartbeat_hours`, `escalated_interval_hours`, and `escalate_at` at 0.79)
+  controls *how often* to post: the minimum gap between messages, and the shorter gap
+  that applies once utilization reaches 79%. **Both are `0` in the deployed job** — see
+  the cadence invariant below before changing either the cron or these.
 - **Severity band** (`bands.py`) controls *how loud* the post is. A band change posts
   immediately regardless of cadence.
 
@@ -85,15 +92,20 @@ down before the band does, never the reverse.
 
 ## This repository is public
 
-- **The Slack webhook is a bearer credential and lives only in GitHub Secrets**
-  (`SLACK_WEBHOOK_URL`). It must never appear in the workflow file, in tracked files, or
-  in a log. `.env` holds it locally and is gitignored — keep it that way.
-- **`state.json` is deliberately NOT gitignored.** The workflow commits it every run, and
-  that commit is what stops GitHub disabling the schedule after 60 days of inactivity.
-  Re-adding it to `.gitignore` would silently kill the bot two months later. It holds only
-  a timestamp, a utilization figure and a band name — nothing sensitive.
-- The workflow rebases and retries on push conflicts, because a delayed run can overlap a
-  newer one. `concurrency` limits that, but does not eliminate it.
+- **The Slack webhook is a bearer credential and lives only in Secret Manager**, as
+  `hl-usdc-slack-webhook-url`, mounted into the job as `SLACK_WEBHOOK_URL` at `:latest`.
+  It must never appear in `deploy/env.yaml`, in a tracked file, in an image layer or in a
+  log. `.env` holds it locally and is gitignored and `.dockerignore`d — keep it that way.
+  `deploy/set-webhook.ps1` is the only supported way to write or rotate it.
+- **This bot's webhook is not the perp-premiums bot's webhook.** They share a GCP project
+  and post to different channels. Crossing them fails silently — each URL is valid, just
+  wrong — so every resource here is named `hl-usdc-*` to make the mix-up hard.
+- **`state.json` stays tracked, but it is now only the local-dev and VM seed.** The
+  deployed job reads and writes `gs://<project>-hl-usdc-state/state.json` instead, so the
+  tracked copy is frozen at the cutover and will look stale. That is expected. It holds
+  only a timestamp, a utilization figure and a band name — nothing sensitive. It used to
+  be committed every run to stop GitHub disabling the cron for inactivity; with the
+  workflow gone, that reason is gone too.
 
 ## Invariants that have already caused bugs
 
@@ -108,11 +120,27 @@ down before the band does, never the reverse.
   leave the previous band intact so the next tick retries instead of swallowing a crossing.
 - **Suppressed ticks must not touch `last_post_ts`.** Restarting the heartbeat clock on
   every quiet tick means the 6-hourly post never comes due.
-- **The Actions checkout pins `ref: ${{ github.ref_name }}`.** Without it `actions/checkout`
-  takes the SHA the scheduled event was *created* from, so a delayed run reads a
-  `state.json` that a newer run already superseded. A stale `last_band` re-fires a crossing
-  alert that was already sent. The exposure scales with the poll rate, which is why this
-  landed alongside the 10-minute cron.
+- **`STATE_BUCKET` must be set in any deployment with an ephemeral filesystem.**
+  `build_store()` falls back to `LocalFileStateStore` when it is empty, and the fallback
+  is *silent*. On Cloud Run that means every tick reads no state, decides `FIRST_RUN` and
+  posts — an hourly stream of duplicates. `deploy/setup.ps1` sets it twice (in
+  `deploy/env.yaml` and again as an override derived from `-Project`) and then asserts it
+  landed in the deployed spec before it will finish. Do not remove that check.
+- **The job is deployed with `--max-retries 0`, on purpose.** A failed Hyperliquid read
+  saves nothing and the next tick recovers; a failed Slack post raises before
+  `store.save()` so the next tick retries by itself. The only case a retry would change is
+  a Slack post that succeeded followed by a state write that did not — and there a retry
+  re-reads stale state and posts a duplicate. Retrying can only hurt. (Cloud Scheduler's
+  own `--max-retry-attempts 3` is different: it retries a failed *enqueue* and cannot
+  double-run a tick already in flight.)
+- **`HEARTBEAT_HOURS` and `ESCALATED_INTERVAL_HOURS` are `0` in the deployed job, and the
+  cron is what governs the post rate.** `decide` suppresses when
+  `now - last_post_ts < interval` and `runner` stamps `last_post_ts` at tick *start*, so
+  an hourly cron against a 1-hour interval lands within seconds of the boundary and a
+  little scheduler jitter decides it — roughly every other hour would suppress, and the
+  bot would post every two hours. Zero makes the check always pass. **If the cron is ever
+  made faster than the intended post rate, put a real interval back in the same change**,
+  or every poll becomes a message.
 - **`GcsStateStore.load` catches only `NotFound`.** Other GCS errors propagate on purpose:
   treating a transient failure as "first run" would post a spurious heartbeat and discard
   the tracked band.
@@ -141,13 +169,18 @@ down before the band does, never the reverse.
   modules import them rather than redefining fixtures.
 - `"pp"` is a substring of `"Supplied"`, so negative assertions about the delta field
   check for `"Δ"` instead.
-- The Dockerfile pins `python:3.14-slim` to match the local interpreter.
+- The Dockerfile pins `python:3.14-slim` to match the local interpreter, and its
+  `ENTRYPOINT` is `python -m hl_usdc_bot.tick_once` — a batch process that exits, which is
+  what Cloud Run Jobs expects. `wsgi.py` is still copied in so the same image can serve
+  the Cloud Run Service path under a `--command` override, but nothing deployed uses it.
 - The VM installs only `deploy/requirements-vm.txt` (`requests`). Flask, gunicorn and the
   GCS client are not needed there and are deliberately absent.
 - The systemd timer sets `Persistent=true`, so a reboot replays the missed tick. That is
   safe precisely because `decide` is time-based rather than run-count-based: a catch-up
-  tick produces at most one message, not a backlog. The same property is why GitHub's
-  dropped scheduled runs are harmless.
-- Default cadence is hourly (`heartbeat_hours = 1`). With `ESCALATED_INTERVAL_HOURS` also
-  1, the `ESCALATE_AT` escalation rule is currently inert — it only does work if the
-  heartbeat is raised above 1.
+  tick produces at most one message, not a backlog. The same property is why a dropped
+  Cloud Run execution costs one reading and never a stale thread.
+- `Config` defaults are `heartbeat_hours = 1` and `escalated_interval_hours = 1`, which
+  leaves the `ESCALATE_AT` escalation rule inert — it only does work when the two differ.
+  Those defaults are for local runs; the deployed job overrides both to `0`. Leave the
+  defaults alone: `tests/test_config.py` pins them, and the Cloudflare and VM hosts use
+  their own values.

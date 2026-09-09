@@ -1,0 +1,14 @@
+# These are parsed by Linux tooling -- the Cloud Build image build, gcloud, and
+# systemd on the VM -- so they must stay LF regardless of a Windows checkout's
+# core.autocrlf setting. A CRLF Dockerfile puts a trailing \r on every RUN line,
+# and a CRLF shell script breaks on its own shebang.
+#
+# .py is deliberately absent: Python reads either ending, so pinning it would
+# only renormalise the whole package for no gain.
+Dockerfile          text eol=lf
+.dockerignore       text eol=lf
+*.yaml              text eol=lf
+*.yml               text eol=lf
+*.sh                text eol=lf
+*.service           text eol=lf
+*.timer             text eol=lf

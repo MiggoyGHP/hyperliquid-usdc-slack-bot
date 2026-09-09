@@ -2,11 +2,30 @@
 tests/
 .git/
 .gitignore
-__pycache__/
-*.pyc
+.gitattributes
+# Docker matches these against the whole path and a single * never crosses a
+# '/', so nested caches need the ** prefix that .gitignore does not.
+**/__pycache__
+**/*.pyc
 .pytest_cache/
+
+# state.json is the local-dev seed only; the job reads its state from GCS.
 state.json
+
+# .env holds the live webhook. Baking it into an image would publish the secret
+# to Artifact Registry, where every image layer is readable by anyone who can
+# pull.
 .env
+.env.*
+
 requirements-dev.txt
 pyproject.toml
 README.md
+CLAUDE.md
+
+# Deployment scaffolding and the other hosts' entrypoints: none of it is copied
+# by the Dockerfile, so keeping it out of the build context speeds the upload.
+deploy/
+.github/
+worker.py
+wrangler.jsonc
